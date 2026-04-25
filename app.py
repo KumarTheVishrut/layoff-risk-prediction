@@ -174,7 +174,20 @@ _CAREER_MAP: Dict[tuple, tuple] = {
     ("Ridesharing",       "Engineering"):     ("Geo-ML Engineer",          5, "$152,000"),
     ("Fitness Tech",      "Engineering"):     ("Health AI Engineer",       5, "$142,000"),
 }
-_DEFAULT_CAREER = ("AI Solutions Engineer", 5, "$145,000")
+
+_DEFAULT_DEPT_CAREERS: Dict[str, tuple] = {
+    "Sales":            ("AI Sales Strategist", 3, "$135,000"),
+    "Marketing":        ("Market AI Director", 3, "$125,000"),
+    "Engineering":      ("AI Solutions Engineer", 5, "$150,000"),
+    "Operations":       ("AI Operations Architecture", 4, "$135,000"),
+    "Support":          ("Support Automation Lead", 3, "$110,000"),
+    "Customer Support": ("Support Automation Lead", 3, "$110,000"),
+    "Content":          ("AI Content Strategist", 2, "$105,000"),
+    "Manufacturing":    ("Robotics/AI Integrator", 6, "$140,000"),
+    "Consulting":       ("AI Transformation Lead", 4, "$150,000"),
+    "IT Services":      ("AI Integration Specialist", 4, "$135,000"),
+}
+_GLOBAL_DEFAULT_CAREER = ("AI Integration Specialist", 4, "$130,000")
 
 _INDUSTRY_MSG: Dict[str, str] = {
     "high":   "Industry has a high recent layoff rate",
@@ -279,7 +292,18 @@ def _top_risk_factors(industry: str, department: str,
 
 
 def _career_advice(industry: str, department: str) -> Dict[str, Any]:
-    role, months, salary = _CAREER_MAP.get((industry, department), _DEFAULT_CAREER)
+    # Search for an exact match ignoring case
+    for (ik, dk), values in _CAREER_MAP.items():
+        if ik.lower() == industry.lower() and dk.lower() == department.lower():
+            return {"target_role": values[0], "time_months": values[1], "salary": values[2]}
+            
+    # Default to department-specific roles
+    for dk, values in _DEFAULT_DEPT_CAREERS.items():
+        if isinstance(values, tuple) and dk.lower() == department.lower():
+            return {"target_role": values[0], "time_months": values[1], "salary": values[2]}
+            
+    # Absolute fallback
+    role, months, salary = _GLOBAL_DEFAULT_CAREER
     return {"target_role": role, "time_months": months, "salary": salary}
 
 
