@@ -1,18 +1,17 @@
 """
-Layoff Risk Prediction API
---------------------------
-FastAPI inference endpoint for the MLOps Layoff Risk platform.
+Layoff Risk Prediction API  v3.0 (TensorFlow)
+---------------------------------------------
+FastAPI inference endpoint for the MLOps Layoff Risk platform — TensorFlow backend.
 
-Endpoints:
-  POST /predict          — single prediction
-  POST /predict/batch    — batch predictions (up to 100 rows)
-  GET  /health           — liveness probe
-  GET  /model/info       — model metadata & schema
-  GET  /industries       — list valid industries
-  GET  /departments      — list valid departments
+Request  POST /predict:
+    { "industry", "department", "ai_exposure", "total_employees" }
 
-All requests are logged to stdout in ELK-compatible JSON (structured logging)
-so Logstash can pick them up and feed the Kibana dashboard.
+Response:
+    { request_id, timestamp, risk_probability, risk_score, risk_label,
+      impact_level, top_risk_factors, career_advice, model_version, latency_ms }
+
+Feature engineering is IDENTICAL to notebook Stage 5 — both load the same
+model weights, preprocessor, and model_schema.json from the models/ directory.
 
 Run:
     uvicorn app:app --host 0.0.0.0 --port 8000 --reload
@@ -22,34 +21,36 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
-import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, status
+import joblib
+import tensorflow as tf
+from tensorflow import keras
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
-# ─────────────────────────────────────────────
-# Structured JSON logger (ELK-compatible)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured JSON logger  — ELK / Logstash compatible
+# ─────────────────────────────────────────────────────────────────────────────
 
 class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-        payload = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "logger": record.name,
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "level":     record.levelname,
+            "message":   record.getMessage(),
+            "logger":    record.name,
         }
         if hasattr(record, "extra"):
-            payload.update(record.extra)  # type: ignore[arg-type]
+            payload.update(record.extra)
         return json.dumps(payload)
 
 
@@ -66,184 +67,257 @@ def _build_logger(name: str) -> logging.Logger:
 log = _build_logger("layoff_risk_api")
 
 
-# ─────────────────────────────────────────────
-# Load model & schema at startup
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact loader  — Keras model + preprocessor + schema from disk
+# ─────────────────────────────────────────────────────────────────────────────
 
-MODELS_DIR  = os.getenv("MODELS_DIR", "./models")
-MODEL_PATH  = os.path.join(MODELS_DIR, "layoff_risk_model.pkl")
-SCHEMA_PATH = os.path.join(MODELS_DIR, "model_schema.json")
+MODELS_DIR         = os.getenv("MODELS_DIR", "./models")
+MODEL_PATH         = os.path.join(MODELS_DIR, "layoff_risk_model.keras")
+PREPROCESSOR_PATH  = os.path.join(MODELS_DIR, "preprocessor.pkl")
+SCHEMA_PATH        = os.path.join(MODELS_DIR, "model_schema.json")
 
-_pipeline: Any = None
-_schema:   Dict[str, Any] = {}
+_MODEL:        keras.Model        = None
+_PREPROCESSOR: Any                = None
+_schema:       Dict[str, Any]    = {}
+
+_AI_MAP:       Dict[str, int]    = {}
+_INDUSTRY_AVG: Dict[str, float]  = {}
+_QUARTER_RISK: Dict[str, float]  = {}
+_BAND_BREAKS:  List[int]         = []
+_BAND_LABELS:  List[str]         = []
+_MEDIAN_OPEN:  float             = 50.0
 
 
 def _load_artifacts() -> None:
-    global _pipeline, _schema
+    global _MODEL, _PREPROCESSOR, _schema
+    global _AI_MAP, _INDUSTRY_AVG, _QUARTER_RISK, _BAND_BREAKS, _BAND_LABELS, _MEDIAN_OPEN
 
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. "
-            "Run the training notebook first to generate model artifacts."
+            "Run training notebook first to generate artifacts."
+        )
+    if not os.path.exists(PREPROCESSOR_PATH):
+        raise FileNotFoundError(
+            f"Preprocessor not found at {PREPROCESSOR_PATH}. "
+            "Run training notebook first."
+        )
+    if not os.path.exists(SCHEMA_PATH):
+        raise FileNotFoundError(
+            f"Schema not found at {SCHEMA_PATH}. "
+            "Run training notebook first."
         )
 
-    _pipeline = joblib.load(MODEL_PATH)
-    log.info("Model loaded", extra={"extra": {"model_path": MODEL_PATH}})
+    _MODEL = keras.models.load_model(MODEL_PATH)
+    _PREPROCESSOR = joblib.load(PREPROCESSOR_PATH)
 
-    if os.path.exists(SCHEMA_PATH):
-        with open(SCHEMA_PATH) as fh:
-            _schema = json.load(fh)
-        log.info("Schema loaded", extra={"extra": {"schema_path": SCHEMA_PATH}})
-    else:
-        log.warning("Schema file not found — some metadata endpoints will be empty.")
+    with open(SCHEMA_PATH) as fh:
+        _schema = json.load(fh)
+
+    _AI_MAP       = _schema["ai_exposure_map"]
+    _INDUSTRY_AVG = _schema["industry_avg_pct_map"]
+    _QUARTER_RISK = _schema["quarter_risk_map"]
+    _BAND_BREAKS  = _schema["workforce_band_breaks"]
+    _BAND_LABELS  = _schema["workforce_band_labels"]
+    _MEDIAN_OPEN  = float(_schema["median_open_positions"])
+
+    log.info("Artifacts loaded", extra={"extra": {
+        "model":      _schema["model_version"],
+        "test_auc":   _schema["test_auc"],
+        "industries": len(_INDUSTRY_AVG),
+    }})
 
 
-# ─────────────────────────────────────────────
-# Feature engineering helpers (mirrors notebook)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Static lookup tables  — response enrichment, not model features
+# ─────────────────────────────────────────────────────────────────────────────
 
-_AI_MAP = {"No": 0, "Partial": 1, "Yes": 2}
+_CAREER_MAP: Dict[tuple, tuple] = {
+    ("Software",          "Engineering"):     ("AI Engineer",              5, "$160,000"),
+    ("Software",          "Sales"):           ("Technical Sales Manager",  4, "$130,000"),
+    ("Software",          "Marketing"):       ("Product Marketing Lead",   3, "$120,000"),
+    ("Software",          "Operations"):      ("DevOps Engineer",          6, "$140,000"),
+    ("Software",          "Content"):         ("AI Content Strategist",    2, "$115,000"),
+    ("Software",          "Customer Support"):("AI Prompt Engineer",       3, "$105,000"),
+    ("Fintech",           "Engineering"):     ("Blockchain Developer",     6, "$155,000"),
+    ("Fintech",           "Sales"):           ("Fintech Solutions Lead",   4, "$125,000"),
+    ("Fintech",           "Operations"):      ("Risk Automation Analyst",  4, "$130,000"),
+    ("EdTech",            "Engineering"):     ("ML Engineer",              5, "$145,000"),
+    ("EdTech",            "Marketing"):       ("AI Content Strategist",    2, "$110,000"),
+    ("Semiconductors",    "Engineering"):     ("AI Hardware Engineer",     8, "$175,000"),
+    ("Semiconductors/AI", "Engineering"):     ("AI Chip Architect",        9, "$185,000"),
+    ("SaaS/CRM",          "Engineering"):     ("Platform Engineer",        4, "$150,000"),
+    ("SaaS/CRM",          "Sales"):           ("Solutions Engineer",       3, "$140,000"),
+    ("Gaming/Software",   "Engineering"):     ("Game AI Developer",        5, "$145,000"),
+    ("Gaming/Software",   "Marketing"):       ("Growth Marketing Manager", 3, "$115,000"),
+    ("Social Media",      "Engineering"):     ("ML Personalization Eng",   6, "$165,000"),
+    ("Social Media",      "Content"):         ("AI Content Strategist",    2, "$110,000"),
+    ("Consulting",        "Operations"):      ("Strategy & Ops Manager",   3, "$135,000"),
+    ("Consulting",        "Consulting"):      ("AI Strategy Consultant",   4, "$145,000"),
+    ("Cryptocurrency",    "Engineering"):     ("Web3 Engineer",            5, "$150,000"),
+    ("Automotive/EV",     "Engineering"):     ("Autonomous Systems Eng",   7, "$170,000"),
+    ("Automotive/EV",     "Manufacturing"):   ("Robotics Engineer",        5, "$155,000"),
+    ("E-commerce",        "Operations"):      ("Supply Chain Analyst",     3, "$120,000"),
+    ("E-commerce",        "Engineering"):     ("Recommender Systems Eng",  5, "$148,000"),
+    ("E-commerce/Cloud",  "Engineering"):     ("Cloud Commerce Engineer",  4, "$150,000"),
+    ("Streaming",         "Engineering"):     ("Video Infra Engineer",     4, "$148,000"),
+    ("Search/AI",         "Engineering"):     ("LLM Engineer",             5, "$175,000"),
+    ("Hardware",          "Engineering"):     ("Embedded AI Engineer",     6, "$160,000"),
+    ("Networking",        "Engineering"):     ("Network Automation Eng",   5, "$145,000"),
+    ("Cloud Storage",     "Engineering"):     ("Cloud Infra Engineer",     4, "$152,000"),
+    ("Live Streaming",    "Engineering"):     ("Real-Time Systems Eng",    5, "$148,000"),
+    ("Travel Tech",       "Engineering"):     ("Travel AI Analyst",        4, "$138,000"),
+    ("Travel Tech",       "Operations"):      ("Revenue Management Analyst",3,"$125,000"),
+    ("Communication",     "Engineering"):     ("Messaging Platform Eng",   4, "$145,000"),
+    ("Music Streaming",   "Engineering"):     ("Audio ML Engineer",        5, "$148,000"),
+    ("Video Conferencing","Engineering"):     ("WebRTC Engineer",          4, "$148,000"),
+    ("Ridesharing",       "Engineering"):     ("Geo-ML Engineer",          5, "$152,000"),
+    ("Fitness Tech",      "Engineering"):     ("Health AI Engineer",       5, "$142,000"),
+}
+_DEFAULT_CAREER = ("AI Solutions Engineer", 5, "$145,000")
 
-_REASON_KEYWORDS: Dict[str, List[str]] = {
-    "ai_automation":    ["ai", "automat"],
-    "financial":        ["profit", "cost"],
-    "restructuring":    ["restructur", "reorg"],
-    "market_conditions":["market", "downturn"],
+_INDUSTRY_MSG: Dict[str, str] = {
+    "high":   "Industry has a high recent layoff rate",
+    "medium": "Industry shows moderate layoff trends",
+    "low":    "Industry has been relatively stable",
+}
+_DEPT_MSG: Dict[str, str] = {
+    "Engineering":      "Engineering roles are relatively stable",
+    "Sales":            "Sales headcount is often first to be cut in downturns",
+    "Marketing":        "Marketing budgets are an early cost-reduction target",
+    "Operations":       "Operations roles face automation-driven reduction risk",
+    "Manufacturing":    "Manufacturing is highly exposed to automation",
+    "Support":          "Support roles have high AI replacement risk",
+    "Content":          "Content roles are increasingly automated by AI",
+    "Customer Support": "Customer support is highly exposed to AI automation",
+    "Consulting":       "Consulting headcount shrinks post-restructuring",
+    "IT Services":      "IT services face both outsourcing and automation pressure",
+    "AWS":              "Cloud infrastructure roles remain in high demand",
+    "Azure":            "Cloud infrastructure roles remain in high demand",
+    "Cloud":            "Cloud roles are relatively protected",
+    "Reality Labs":     "XR/metaverse investments are being scaled back industry-wide",
+}
+_DEFAULT_DEPT_MSG = "Department shows average stability in current market"
+
+_SIZE_MSG: Dict[str, str] = {
+    "small":      "Small company size increases individual role risk",
+    "mid":        "Mid-size company — moderate structural risk",
+    "large":      "Large company size reduces but does not eliminate risk",
+    "enterprise": "Enterprise scale reduces risk of total role elimination",
+}
+_AI_MSG: Dict[str, str] = {
+    "Yes":     "High AI adoption signals role automation risk",
+    "Partial": "Partial AI adoption may trigger selective automation cuts",
+    "No":      "Low AI exposure limits automation-driven layoff risk",
 }
 
 
-def _categorize_reason(reason: str) -> str:
-    r = reason.lower()
-    for category, keywords in _REASON_KEYWORDS.items():
-        if any(kw in r for kw in keywords):
-            return category
-    return "other"
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature engineering — IDENTICAL to notebook Stage 5
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _workforce_band(n: int) -> str:
+    if n < _BAND_BREAKS[1]: return _BAND_LABELS[0]
+    if n < _BAND_BREAKS[2]: return _BAND_LABELS[1]
+    if n < _BAND_BREAKS[3]: return _BAND_LABELS[2]
+    return _BAND_LABELS[3]
 
 
-def _derive_workforce_band(total_employees: int) -> str:
-    if total_employees < 1000:
-        return "small"
-    if total_employees < 5000:
-        return "mid"
-    if total_employees < 20000:
-        return "large"
-    return "enterprise"
+def _build_feature_row(industry: str, department: str,
+                       ai_exposure: str, total_employees: int) -> pd.DataFrame:
+    ai_num   = _AI_MAP.get(ai_exposure, 0)
+    ind_avg  = _INDUSTRY_AVG.get(industry, 10.0)
+    q_score  = float(_QUARTER_RISK.get("1", 0.5))
+    est_laid = max(1, int(total_employees * ind_avg / 100))
+    band     = _workforce_band(total_employees)
+
+    return pd.DataFrame([{
+        "Employees_Laid_Off":          est_laid,
+        "Severance_Weeks":             8,
+        "Total_Employees":             total_employees,
+        "workforce_log":               math.log1p(total_employees),
+        "ai_exposure_num":             ai_num,
+        "industry_avg_workforce_pct":  ind_avg,
+        "avg_open_positions":          _MEDIAN_OPEN,
+        "quarter_risk_score":          q_score,
+        "Month":                       1,
+        "Quarter":                     1,
+        "Industry":                    industry,
+        "reason_category":             "restructuring",
+        "workforce_band":              band,
+        "primary_dept":                department,
+    }])
 
 
-def _build_feature_row(req: "PredictRequest") -> pd.DataFrame:
-    """Convert a PredictRequest into a single-row DataFrame matching training features."""
-    ai_num = _AI_MAP.get(req.ai_exposure, 0)
-    industry_avg = _schema.get("industry_avg_pct_map", {}).get(req.industry, 10.0)
-    median_open  = _schema.get("median_open_positions", 50.0)
-    qmap         = _schema.get("quarter_risk_map", {})
-    q_score      = float(qmap.get(str(req.quarter), 0.5))
+# ─────────────────────────────────────────────────────────────────────────────
+# Response enrichment helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    row = {
-        # Numeric
-        "Employees_Laid_Off":         req.employees_laid_off,
-        "Severance_Weeks":            req.severance_weeks,
-        "Total_Employees":            req.total_employees,
-        "workforce_log":              float(np.log1p(req.total_employees)),
-        "ai_exposure_num":            ai_num,
-        "industry_avg_workforce_pct": industry_avg,
-        "avg_open_positions":         median_open,
-        "quarter_risk_score":         q_score,
-        "Month":                      req.month,
-        "Quarter":                    req.quarter,
-        # Categorical
-        "Industry":                   req.industry,
-        "reason_category":            _categorize_reason(req.layoff_reason),
-        "workforce_band":             _derive_workforce_band(req.total_employees),
-        "primary_dept":               req.primary_department,
-    }
-
-    return pd.DataFrame([row])
+def _risk_label(prob: float) -> str:
+    if prob >= 0.65: return "HIGH"
+    if prob >= 0.35: return "MEDIUM"
+    return "LOW"
 
 
-# ─────────────────────────────────────────────
-# Pydantic request/response models
-# ─────────────────────────────────────────────
+def _impact_level(prob: float) -> str:
+    if prob >= 0.65: return "SEVERE"
+    if prob >= 0.45: return "MODERATE"
+    if prob >= 0.25: return "LOW"
+    return "MINIMAL"
+
+
+def _top_risk_factors(industry: str, department: str,
+                      ai_exposure: str, total_employees: int) -> List[str]:
+    ind_avg  = _INDUSTRY_AVG.get(industry, 10.0)
+    ind_tier = "high" if ind_avg >= 15 else ("medium" if ind_avg >= 7 else "low")
+    return [
+        _INDUSTRY_MSG[ind_tier],
+        _DEPT_MSG.get(department, _DEFAULT_DEPT_MSG),
+        _SIZE_MSG[_workforce_band(total_employees)],
+        _AI_MSG.get(ai_exposure, "AI exposure impact is unclear"),
+    ]
+
+
+def _career_advice(industry: str, department: str) -> Dict[str, Any]:
+    role, months, salary = _CAREER_MAP.get((industry, department), _DEFAULT_CAREER)
+    return {"target_role": role, "time_months": months, "salary": salary}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pydantic schemas
+# ─────────────────────────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
-    """Input schema for a single layoff risk prediction."""
-
-    industry: str = Field(
-        ...,
-        description="Company industry (e.g. 'Software', 'Fintech', 'EdTech')",
-        examples=["Software"]
-    )
-    primary_department: str = Field(
-        ...,
-        description="Primary department affected (e.g. 'Engineering', 'Sales')",
-        examples=["Engineering"]
-    )
-    ai_exposure: str = Field(
-        ...,
-        description="Company's AI adoption level: 'No', 'Partial', or 'Yes'",
-        examples=["Partial"]
-    )
-    total_employees: int = Field(
-        ..., gt=0,
-        description="Total headcount at the company",
-        examples=[5000]
-    )
-    employees_laid_off: int = Field(
-        ..., ge=0,
-        description="Number of employees being laid off",
-        examples=[500]
-    )
-    severance_weeks: int = Field(
-        default=8, ge=0, le=52,
-        description="Severance package duration in weeks",
-        examples=[8]
-    )
-    layoff_reason: str = Field(
-        default="restructuring",
-        description="Reason for the layoff event",
-        examples=["AI replacing content creators"]
-    )
-    month: int = Field(
-        default=1, ge=1, le=12,
-        description="Month of the layoff (1–12)",
-        examples=[1]
-    )
-    quarter: int = Field(
-        default=1, ge=1, le=4,
-        description="Quarter of the year (1–4)",
-        examples=[1]
-    )
+    industry: str = Field(..., examples=["Software"])
+    department: str = Field(..., examples=["Engineering"])
+    ai_exposure: str = Field(..., examples=["Partial"])
+    total_employees: int = Field(..., gt=0, examples=[5000])
 
     @field_validator("ai_exposure")
     @classmethod
     def validate_ai_exposure(cls, v: str) -> str:
-        valid = {"No", "Partial", "Yes"}
-        if v not in valid:
-            raise ValueError(f"ai_exposure must be one of {valid}")
+        if v not in {"No", "Partial", "Yes"}:
+            raise ValueError("ai_exposure must be 'No', 'Partial', or 'Yes'")
         return v
 
-    @model_validator(mode="after")
-    def employees_cannot_exceed_total(self) -> "PredictRequest":
-        if self.employees_laid_off > self.total_employees:
-            raise ValueError("employees_laid_off cannot exceed total_employees")
-        return self
 
-
-class RiskLevel(str):
-    LOW    = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH   = "HIGH"
+class CareerAdvice(BaseModel):
+    target_role: str
+    time_months: int
+    salary:      str
 
 
 class PredictResponse(BaseModel):
-    request_id:        str
-    timestamp:         str
-    risk_label:        str        # HIGH / MEDIUM / LOW
-    risk_probability:  float      # 0.0 – 1.0
-    risk_score:        int        # 0 – 100
-    percentage_workforce_affected: float
-    top_risk_factors:  List[str]
-    model_version:     str
-    latency_ms:        float
+    request_id:       str
+    timestamp:        str
+    risk_probability: float
+    risk_score:       int
+    risk_label:       str
+    impact_level:     str
+    top_risk_factors: List[str]
+    career_advice:    CareerAdvice
+    model_version:    str
+    latency_ms:       float
 
 
 class BatchPredictRequest(BaseModel):
@@ -263,48 +337,51 @@ class HealthResponse(BaseModel):
     timestamp:     str
 
 
-# ─────────────────────────────────────────────
-# Risk interpretation helpers
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Core inference function — TensorFlow backend
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _risk_label(prob: float) -> str:
-    if prob >= 0.65:
-        return "HIGH"
-    if prob >= 0.35:
-        return "MEDIUM"
-    return "LOW"
+def run_inference(industry: str, department: str,
+                  ai_exposure: str, total_employees: int) -> PredictResponse:
+    """
+    Pure inference — no FastAPI dependency.
+    Uses Keras model + sklearn preprocessor.
+    """
+    t0    = time.perf_counter()
+    X_row = _build_feature_row(industry, department, ai_exposure, total_employees)
+    
+    # Preprocess → dense numpy → predict
+    X_processed = np.array(_PREPROCESSOR.transform(X_row))
+    prob        = float(_MODEL.predict(X_processed, verbose=0).ravel()[0])
+    
+    ms = round((time.perf_counter() - t0) * 1000, 2)
+
+    return PredictResponse(
+        request_id=       str(uuid.uuid4()),
+        timestamp=        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        risk_probability= round(prob, 4),
+        risk_score=       int(prob * 100),
+        risk_label=       _risk_label(prob),
+        impact_level=     _impact_level(prob),
+        top_risk_factors= _top_risk_factors(industry, department, ai_exposure, total_employees),
+        career_advice=    CareerAdvice(**_career_advice(industry, department)),
+        model_version=    _schema["model_version"],
+        latency_ms=       ms,
+    )
 
 
-def _top_risk_factors(req: PredictRequest) -> List[str]:
-    """Heuristic explanations surfaced alongside the model score."""
-    factors: List[str] = []
-    pct = (req.employees_laid_off / req.total_employees) * 100
-    if pct > 15:
-        factors.append(f"Large workforce reduction ({pct:.1f}% of headcount)")
-    if req.ai_exposure == "Yes":
-        factors.append("High AI automation exposure in the company")
-    if req.quarter == 1:
-        factors.append("Q1 — historically the highest layoff quarter")
-    if req.severance_weeks <= 6:
-        factors.append("Below-average severance indicates urgent cost cutting")
-    if any(kw in req.layoff_reason.lower() for kw in ["ai", "automat"]):
-        factors.append("Layoff reason linked to AI-driven role elimination")
-    if not factors:
-        factors.append("No dominant single risk factor — composite model signal")
-    return factors[:4]
-
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Layoff Risk Prediction API",
     description=(
-        "MLOps platform that predicts company layoff risk from industry, "
-        "department, and AI exposure signals. Trained on live LinkedIn + news data."
+        "MLOps platform predicting company layoff risk from industry, "
+        "department, and AI exposure. TensorFlow backend. "
+        "All logs feed ELK → Kibana."
     ),
-    version="1.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -320,185 +397,128 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event() -> None:
     _load_artifacts()
-    log.info("API startup complete")
+    log.info("API ready", extra={"extra": {"version": "3.0.0"}})
 
-
-# ─── Middleware: request tracing + ELK log ───
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):  # type: ignore[no-untyped-def]
-    request_id = str(uuid.uuid4())
-    start      = time.perf_counter()
-
-    response = await call_next(request)
-
-    latency = (time.perf_counter() - start) * 1000
-    log.info(
-        "request",
-        extra={
-            "extra": {
-                "request_id": request_id,
-                "method":     request.method,
-                "path":       request.url.path,
-                "status":     response.status_code,
-                "latency_ms": round(latency, 2),
-            }
-        },
-    )
-    response.headers["X-Request-ID"] = request_id
-    return response
+async def log_requests(request: Request, call_next):
+    rid   = str(uuid.uuid4())
+    start = time.perf_counter()
+    resp  = await call_next(request)
+    ms    = round((time.perf_counter() - start) * 1000, 2)
+    log.info("http", extra={"extra": {
+        "request_id": rid, "method": request.method,
+        "path": request.url.path, "status": resp.status_code, "latency_ms": ms,
+    }})
+    resp.headers["X-Request-ID"] = rid
+    return resp
 
 
-# ─────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["Meta"])
 def health() -> HealthResponse:
-    """Liveness probe — used by Kubernetes / load balancers."""
+    """Liveness probe."""
     return HealthResponse(
-        status="ok",
-        model_loaded=_pipeline is not None,
-        model_version=_schema.get("best_model", "unknown"),
-        timestamp=datetime.utcnow().isoformat() + "Z",
+        status="ok", model_loaded=_MODEL is not None,
+        model_version=_schema.get("model_version", "unknown"),
+        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
 
 @app.get("/model/info", tags=["Meta"])
 def model_info() -> Dict[str, Any]:
-    """Return model metadata, feature schema, and performance metrics."""
+    """Model metadata and test performance."""
     if not _schema:
         raise HTTPException(status_code=503, detail="Schema not loaded.")
     return {
-        "model":             _schema.get("best_model"),
-        "test_auc":          _schema.get("test_auc"),
-        "numeric_features":  _schema.get("numeric_features", []),
+        "model_version":        _schema.get("model_version"),
+        "best_model":           _schema.get("best_model"),
+        "test_auc":             _schema.get("test_auc"),
+        "test_ap":              _schema.get("test_ap"),
+        "risk_threshold_pct":   _schema.get("risk_threshold"),
+        "score_threshold":      _schema.get("score_threshold"),
+        "numeric_features":     _schema.get("numeric_features", []),
         "categorical_features": _schema.get("categorical_features", []),
-        "risk_threshold_pct": _schema.get("risk_threshold"),
     }
 
 
 @app.get("/industries", tags=["Meta"])
 def list_industries() -> Dict[str, List[str]]:
-    """Valid industry values accepted by the /predict endpoint."""
-    return {"industries": _schema.get("industries", [])}
+    return {"industries": sorted(_INDUSTRY_AVG.keys())}
 
 
 @app.get("/departments", tags=["Meta"])
 def list_departments() -> Dict[str, List[str]]:
-    """Valid department values accepted by the /predict endpoint."""
-    return {"departments": _schema.get("departments", [])}
+    return {"departments": sorted(_DEPT_MSG.keys())}
 
 
 @app.post("/predict", response_model=PredictResponse, tags=["Inference"])
 def predict(req: PredictRequest) -> PredictResponse:
     """
-    Predict layoff risk for a single company / department.
+    Predict layoff risk for a single company.
 
-    Returns a risk label (LOW / MEDIUM / HIGH), probability score (0–1),
-    and the top contributing risk factors.
+    Input:
+    ```json
+    { "industry": "Software", "department": "Engineering",
+      "ai_exposure": "Partial", "total_employees": 5000 }
+    ```
     """
-    if _pipeline is None:
-        raise HTTPException(status_code=503, detail="Model not loaded. Try again later.")
-
-    t0 = time.perf_counter()
+    if _MODEL is None or _PREPROCESSOR is None:
+        raise HTTPException(status_code=503, detail="Model not loaded.")
 
     try:
-        X = _build_feature_row(req)
-        prob = float(_pipeline.predict_proba(X)[0][1])
+        response = run_inference(
+            req.industry, req.department, req.ai_exposure, req.total_employees
+        )
     except Exception as exc:
-        log.error("Prediction error", extra={"extra": {"error": str(exc)}})
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
+        log.error("predict_error", extra={"extra": {"error": str(exc)}})
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    latency = (time.perf_counter() - t0) * 1000
-    pct_affected = round((req.employees_laid_off / req.total_employees) * 100, 2)
-
-    response = PredictResponse(
-        request_id=str(uuid.uuid4()),
-        timestamp=datetime.utcnow().isoformat() + "Z",
-        risk_label=_risk_label(prob),
-        risk_probability=round(prob, 4),
-        risk_score=int(prob * 100),
-        percentage_workforce_affected=pct_affected,
-        top_risk_factors=_top_risk_factors(req),
-        model_version=_schema.get("best_model", "unknown"),
-        latency_ms=round(latency, 2),
-    )
-
-    # ELK-structured prediction log (feeds Kibana dashboard)
-    log.info(
-        "prediction",
-        extra={
-            "extra": {
-                "request_id":      response.request_id,
-                "industry":        req.industry,
-                "department":      req.primary_department,
-                "ai_exposure":     req.ai_exposure,
-                "risk_label":      response.risk_label,
-                "risk_probability":response.risk_probability,
-                "risk_score":      response.risk_score,
-                "pct_affected":    pct_affected,
-                "latency_ms":      response.latency_ms,
-            }
-        },
-    )
-
+    log.info("prediction", extra={"extra": {
+        "request_id":       response.request_id,
+        "industry":         req.industry,
+        "department":       req.department,
+        "ai_exposure":      req.ai_exposure,
+        "total_employees":  req.total_employees,
+        "risk_label":       response.risk_label,
+        "impact_level":     response.impact_level,
+        "risk_probability": response.risk_probability,
+        "risk_score":       response.risk_score,
+        "latency_ms":       response.latency_ms,
+    }})
     return response
 
 
 @app.post("/predict/batch", response_model=BatchPredictResponse, tags=["Inference"])
 def predict_batch(batch: BatchPredictRequest) -> BatchPredictResponse:
-    """
-    Predict layoff risk for up to 100 companies in a single request.
-
-    Processes each row independently and returns results in the same order
-    as the input list.
-    """
-    if _pipeline is None:
+    """Predict layoff risk for up to 100 companies in one call."""
+    if _MODEL is None or _PREPROCESSOR is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    t0 = time.perf_counter()
+    t0      = time.perf_counter()
     results: List[PredictResponse] = []
 
     for req in batch.requests:
         try:
-            X    = _build_feature_row(req)
-            prob = float(_pipeline.predict_proba(X)[0][1])
+            results.append(run_inference(
+                req.industry, req.department, req.ai_exposure, req.total_employees
+            ))
         except Exception as exc:
-            log.error("Batch item error", extra={"extra": {"error": str(exc)}})
-            prob = 0.0  # degrade gracefully; surface error in risk_factors
-
-        pct_affected = round((req.employees_laid_off / req.total_employees) * 100, 2)
-        results.append(
-            PredictResponse(
+            log.error("batch_item_error", extra={"extra": {"error": str(exc)}})
+            results.append(PredictResponse(
                 request_id=str(uuid.uuid4()),
-                timestamp=datetime.utcnow().isoformat() + "Z",
-                risk_label=_risk_label(prob),
-                risk_probability=round(prob, 4),
-                risk_score=int(prob * 100),
-                percentage_workforce_affected=pct_affected,
-                top_risk_factors=_top_risk_factors(req),
-                model_version=_schema.get("best_model", "unknown"),
-                latency_ms=0.0,  # set at batch level
-            )
-        )
+                timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                risk_probability=0.0, risk_score=0, risk_label="LOW",
+                impact_level="MINIMAL", top_risk_factors=[f"Error: {exc}"],
+                career_advice=CareerAdvice(target_role="N/A", time_months=0, salary="N/A"),
+                model_version=_schema.get("model_version", "unknown"), latency_ms=0.0,
+            ))
 
-    total_latency = (time.perf_counter() - t0) * 1000
-    log.info(
-        "batch_prediction",
-        extra={"extra": {"batch_size": len(results), "latency_ms": round(total_latency, 2)}},
-    )
+    total_ms = round((time.perf_counter() - t0) * 1000, 2)
+    log.info("batch", extra={"extra": {"batch_size": len(results), "latency_ms": total_ms}})
+    return BatchPredictResponse(total=len(results), results=results, latency_ms=total_ms)
 
-    return BatchPredictResponse(
-        total=len(results),
-        results=results,
-        latency_ms=round(total_latency, 2),
-    )
-
-
-# ─────────────────────────────────────────────
-# Dev entrypoint
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
